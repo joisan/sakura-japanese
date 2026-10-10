@@ -1,0 +1,26 @@
+{
+ "name": "樱语日语",
+ "short_name": "樱语日语",
+ "description": "日语学习：假名、汉字、词汇、造句和生活会话",
+ "start_url": "./",
+ "scope": "./",
+ "display": "standalone",
+ "orientation": "portrait",
+ "background_color": "#fbf7f1",
+ "theme_color": "#f43f5e",
+ "lang": "zh-CN",
+ "icons": [
+  {
+   "src": "icon-192.png",
+   "sizes": "192x192",
+   "type": "image/png",
+   "purpose": "any maskable"
+  },
+  {
+   "src": "icon-512.png",
+   "sizes": "512x512",
+   "type": "image/png",
+   "purpose": "any maskable"
+  }
+ ]
+}
