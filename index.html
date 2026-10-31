@@ -599,7 +599,7 @@ const TOT = Object.values(ITEMS).reduce((a, x) => (a[x.type] = (a[x.type] || 0) 
    四、存档（localStorage）
    ===================================================================== */
 const KEY = 'sakuraJP:v1';
-function defaultState() { return { v: 1, lessons: {}, xp: 0, days: {}, cursor: null, bestCombo: 0, settings: { rate: 0.9, sfx: true, unlockAll: false, autoSpeak: true, furigana: true, speakPractice: true }, updatedAt: 0, resetAt: 0 }; }
+function defaultState() { return { v: 1, lessons: {}, xp: 0, days: {}, cursor: null, bestCombo: 0, settings: { rate: 0.9, sfx: true, unlockAll: false, autoSpeak: true, furigana: true, speakPractice: true }, updatedAt: 0, resetAt: 0, clearedAt: 0 }; }
 function loadState() {
   try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.v === 1) { const d = defaultState(); return { ...d, ...s, settings: { ...d.settings, ...s.settings } }; } } catch (e) {}
   return defaultState();
@@ -616,8 +616,10 @@ let syncProvider = null;
 let syncRef = null, syncState = 'off', syncTimer = null, syncPushing = false, syncAgain = false, lastPushed = '';
 /* 合并两份进度：分数、星级、学习时间取较大值，不会丢失任何一边的成绩 */
 function mergeState(a, b) {
-  if ((b.resetAt || 0) > (a.resetAt || 0)) return { ...b, settings: a.settings };
-  if ((a.resetAt || 0) > (b.resetAt || 0)) return a;
+  /* Only an explicit "clear all progress" (clearedAt) can discard data, and only data saved before it. */
+  const ca = a.clearedAt || 0, cb = b.clearedAt || 0;
+  if (cb > ca && (a.updatedAt || 0) <= cb) return { ...b, settings: a.settings };
+  if (ca > cb && (b.updatedAt || 0) <= ca) return a;
   const bNewer = (b.updatedAt || 0) > (a.updatedAt || 0);
   const out = { ...a, lessons: { ...a.lessons }, days: { ...a.days } };
   for (const [id, r] of Object.entries(b.lessons || {})) {
@@ -634,6 +636,7 @@ function mergeState(a, b) {
   out.xp = Math.max(a.xp || 0, b.xp || 0); out.bestCombo = Math.max(a.bestCombo || 0, b.bestCombo || 0);
   if (bNewer) out.cursor = b.cursor;
   out.updatedAt = Math.max(a.updatedAt || 0, b.updatedAt || 0);
+  out.clearedAt = Math.max(ca, cb); out.resetAt = Math.max(a.resetAt || 0, b.resetAt || 0);
   return out;
 }
 function setSync(st) {
@@ -704,7 +707,7 @@ function sanitizeState(d) {
   const num = (v, lo = 0, hi = 1e12) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo; };
   const dateRe = /^\d{4}-\d{2}-\d{2}$/;
   out.xp = Math.round(num(d.xp)); out.bestCombo = Math.round(num(d.bestCombo, 0, 1e6));
-  out.updatedAt = num(d.updatedAt); out.resetAt = num(d.resetAt);
+  out.updatedAt = num(d.updatedAt); out.resetAt = num(d.resetAt); out.clearedAt = num(d.clearedAt);
   const def = defaultState().settings, st = d.settings || {};
   for (const k of Object.keys(def)) { if (typeof st[k] === typeof def[k]) out.settings[k] = k === 'rate' ? num(st[k], 0.5, 1.5) : st[k]; }
   if (typeof st.gClientId === 'string' && /^[\w.-]{0,200}$/.test(st.gClientId)) out.settings.gClientId = st.gClientId;
@@ -820,7 +823,7 @@ function gdAutoRenew() {
   gdSignIn().then(() => gdSync(), () => {}).finally(() => { GD.renewing = false; });
 }
 async function gdFetch(url, opts = {}) {
-  const r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: 'Bearer ' + GD.token } });
+  const r = await fetch(url, { ...opts, cache: 'no-store', headers: { ...(opts.headers || {}), Authorization: 'Bearer ' + GD.token } });
   if (r.status === 401 || r.status === 403) { GD.token = null; try { localStorage.removeItem(GD.key); } catch (e) {} setSync('login'); throw new Error('auth'); }
   if (!r.ok) throw new Error('drive ' + r.status);
   return r;
@@ -872,20 +875,20 @@ async function gdSync(opts = {}) {
 function gdMaybeSync() { if (syncProvider === 'gdrive' && !document.hidden && gdTokenOk() && Date.now() - lastSyncAt > 15000) gdSync(); }
 window.addEventListener('focus', gdMaybeSync);
 window.addEventListener('pageshow', gdMaybeSync);
-const APP_VER = '2026-11-01b';
+const APP_VER = '2026-11-01d';
 const doneCount = st => Object.values(st.lessons || {}).filter(r => r && r.best != null && r.best >= 60).length;
 async function gdDiag() {
   const box = document.getElementById('gdDiag'); if (!box) return;
   const line = (k, v) => { const p = document.createElement('p'); const a = document.createElement('span'); a.className = 'text-slate-500'; a.textContent = k; const b = document.createElement('b'); b.textContent = v; p.append(a, b); return p; };
   try {
     if (!GD.email) { const j = await (await gdFetch('https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)')).json(); GD.email = (j.user && j.user.emailAddress) || '?'; }
-    const files = await gdList(); let cloud = '没有';
+    const files = await gdList(); GD.nFiles = files.length; let cloud = '没有';
     if (files[0]) { try { const d = JSON.parse(await (await gdFetch(`https://www.googleapis.com/drive/v3/files/${files[0].id}?alt=media`)).text()); cloud = doneCount(d) + ' 课' + (d.updatedAt ? ' · ' + new Date(d.updatedAt).toLocaleString() : ''); } catch (e) { cloud = '?'; } }
     box.replaceChildren(
       line('Google 账号：', GD.email),
       line('本机已完成：', doneCount(S) + ' 课' + (S.updatedAt ? ' · ' + new Date(S.updatedAt).toLocaleString() : '')),
       line('Drive 上的进度：', cloud),
-      line('版本：', APP_VER));
+      line('版本：', APP_VER + ' · ' + (gdClientId().split('-')[0] || '?') + ' · ' + GD.nFiles + ' 个文件'));
   } catch (e) { box.textContent = '读取诊断信息失败'; }
 }
 async function initDrive() {
@@ -1796,7 +1799,7 @@ document.addEventListener('click', e => {
     case 'copycode': { const ta = $('#bkOut'); const done = () => toast('已复制进度代码'); const fallback = () => { ta.focus(); ta.select(); toast('已选中，请长按或按 Ctrl+C 复制'); }; try { navigator.clipboard.writeText(ta.value).then(done, fallback); } catch (er) { fallback(); } break; }
     case 'savefile': saveFile(); break;
     case 'importcode': importData(($('#bkIn') || {}).value || ''); break;
-    case 'resetyes': S = defaultState(); S.resetAt = Date.now(); save(); pushNow(); closeModal(); V = { name: 'home' }; render(); toast('已清除全部进度'); break;
+    case 'resetyes': S = defaultState(); S.clearedAt = Date.now(); save(); pushNow(); closeModal(); V = { name: 'home' }; render(); toast('已清除全部进度'); break;
     case 'reset': showModal(`<div class="p-6"><h3 class="text-xl font-black">清除全部进度？</h3><p class="mt-2 text-slate-600">所有课程的分数、星级和学习时间都会被删除，无法恢复。建议先备份进度代码。</p><div class="grid grid-cols-2 gap-2 mt-6"><button data-action="settings" class="${btn('py-3 bg-white border-2 border-slate-200')}">取消</button><button data-action="resetyes" class="${btn('py-3 bg-red-500 border-red-700 text-white')}">确认清除</button></div></div>`); break;
   }
 });
@@ -1839,7 +1842,7 @@ document.addEventListener('input', e => { const t = e.target; if (t.dataset.sett
 function importData(text) {
   try {
     const d = JSON.parse(String(text).trim()); if (d.v !== 1 || !d.lessons) throw 0;
-    S = sanitizeState(d); if (S.cursor && S.cursor.phase === 'quiz') S.cursor.quiz = buildQuiz(LMAP[S.cursor.id]); S.resetAt = Date.now(); save(); pushNow(); closeModal(); V = { name: 'home' }; render(); toast('✅ 进度已导入');
+    { const imp = sanitizeState(d); imp.updatedAt = Date.now(); S = mergeState(S, imp); } if (S.cursor && S.cursor.phase === 'quiz' && !S.cursor.quiz) S.cursor.quiz = buildQuiz(LMAP[S.cursor.id]); save(); pushNow(); closeModal(); V = { name: 'home' }; render(); toast('✅ 进度已导入');
   } catch (er) { toast('❌ 进度代码不正确，请完整复制后再试'); }
 }
 function showBackup() {
