@@ -767,12 +767,12 @@ async function initSync() {
     if (!syncSub) syncSub = ref.onSnapshot(sn => { if (sn.exists && !sn.metadata.hasPendingWrites && sn.data().json !== lastPushed) { applyRemote(sn.data()); lastSyncAt = Date.now(); } }, () => { syncSub = null; setSync('error'); });
   } catch (e) { setSync('error'); }
 }
-document.addEventListener('visibilitychange', () => { if (document.hidden) pushNow({ leaving: true }); else if (syncProvider === 'gdrive' && gdTokenOk()) gdSync(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) pushNow({ leaving: true }); else if (syncProvider === 'gdrive') { if (gdTokenOk()) gdSync(); else if (syncState !== 'login') setSync('login'); } });
 
 /* ---------- Google Drive 同步（放在自己的网站上时使用） ----------
    进度保存在 Google Drive 的「appDataFolder」——只有这个 App 能看到的隐藏文件夹。
    每 5 分钟自动同步一次：先读取 Drive 上的进度并合并，再把合并后的结果写回。 */
-const GD = { file: 'sakura-japanese-progress.json', token: null, exp: 0, fileId: null, timer: null };
+const GD = { file: 'sakura-japanese-progress.json', token: null, exp: 0, fileId: null, timer: null, key: 'sakuraJP:gd' };
 const gdClientId = () => String(window.GOOGLE_CLIENT_ID || S.settings.gClientId || '').trim();
 const canDrive = () => location.protocol === 'https:' && !inFrame && !!gdClientId();
 const gdTokenOk = () => !!GD.token && Date.now() < GD.exp;
@@ -785,33 +785,48 @@ function loadGis() {
     document.head.appendChild(sc);
   });
 }
-async function gdSignIn() {
-  await loadGis();
-  return new Promise((res, rej) => {
+function gdSignIn() {
+  const go = () => new Promise((res, rej) => {
     const tc = google.accounts.oauth2.initTokenClient({
       client_id: gdClientId(), scope: 'https://www.googleapis.com/auth/drive.appdata',
       callback: r => {
         if (r.error) return rej(r);
         GD.token = r.access_token; GD.exp = Date.now() + (Number(r.expires_in || 3600) - 120) * 1000;
-        try { localStorage.setItem('sakuraJP:gd', JSON.stringify([GD.token, GD.exp])); } catch (e) {}
+        try { localStorage.setItem(GD.key, JSON.stringify([GD.token, GD.exp])); } catch (e) {}
         res();
       },
       error_callback: e => rej(e)
     });
     tc.requestAccessToken({ prompt: S.settings.gdLinked ? '' : 'consent' });
   });
+  if (window.google && google.accounts && google.accounts.oauth2) return go();
+  return loadGis().then(go);
+}
+/* 登录过期后，在主页、结果页等画面点任何按钮时自动续期（学习和答题中不打扰） */
+function gdAutoRenew() {
+  if (syncProvider !== 'gdrive' || !S.settings.gdLinked || GD.renewing) return;
+  if (GD.token && GD.exp - Date.now() > 5 * 60 * 1000) return;
+  if (['learn', 'quiz', 'intro'].includes(V.name)) return;
+  if (Date.now() - (GD.lastTry || 0) < 90 * 1000) return;
+  if (!(window.google && google.accounts && google.accounts.oauth2)) { loadGis().catch(() => {}); return; }
+  GD.lastTry = Date.now(); GD.renewing = true;
+  gdSignIn().then(() => gdSync(), () => {}).finally(() => { GD.renewing = false; });
 }
 async function gdFetch(url, opts = {}) {
   const r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: 'Bearer ' + GD.token } });
-  if (r.status === 401 || r.status === 403) { GD.token = null; try { localStorage.removeItem('sakuraJP:gd'); } catch (e) {} setSync('login'); throw new Error('auth'); }
+  if (r.status === 401 || r.status === 403) { GD.token = null; try { localStorage.removeItem(GD.key); } catch (e) {} setSync('login'); throw new Error('auth'); }
   if (!r.ok) throw new Error('drive ' + r.status);
   return r;
 }
+async function gdList() {
+  const q = encodeURIComponent(`name='${GD.file}' and trashed=false`);
+  const j = await (await gdFetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id,modifiedTime)&orderBy=modifiedTime%20desc&pageSize=10`)).json();
+  return j.files || [];
+}
 async function gdFindFile() {
   if (GD.fileId) return GD.fileId;
-  const q = encodeURIComponent(`name='${GD.file}'`);
-  const j = await (await gdFetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id,modifiedTime)&orderBy=modifiedTime%20desc&pageSize=5`)).json();
-  GD.fileId = j.files && j.files[0] ? j.files[0].id : null;
+  const f = await gdList();
+  GD.fileId = f[0] ? f[0].id : null;
   return GD.fileId;
 }
 async function gdRead() { const id = await gdFindFile(); if (!id) return null; return (await gdFetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`)).text(); }
@@ -829,10 +844,17 @@ async function gdSync(opts = {}) {
   try {
     if (opts.leaving) { const json = syncPayload(); if (json !== lastPushed) { await gdWrite(json, true); lastPushed = json; } }
     else {
-      const txt = await gdRead();
-      if (txt) applyRemote({ json: txt });
+      const files = await gdList();
+      GD.fileId = files[0] ? files[0].id : null;
+      let txt = null;
+      for (const f of files) {
+        const t = await (await gdFetch(`https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`)).text();
+        if (f === files[0]) txt = t;
+        if (t) applyRemote({ json: t });
+      }
       const json = syncPayload();
-      if (json !== lastPushed && json !== txt) await gdWrite(json);
+      if ((json !== lastPushed && json !== txt) || files.length > 1) await gdWrite(json);
+      for (const f of files.slice(1)) { try { await gdFetch(`https://www.googleapis.com/drive/v3/files/${f.id}`, { method: 'DELETE' }); } catch (e) {} }
       lastPushed = json;
     }
     lastSyncAt = Date.now(); setSync('ok');
@@ -842,6 +864,7 @@ async function gdSync(opts = {}) {
 }
 async function initDrive() {
   syncProvider = 'gdrive';
+  if (S.settings.gdLinked) loadGis().catch(() => {});
   if (!GD.timer) GD.timer = setInterval(() => { if (gdTokenOk()) gdSync(); else if (syncState !== 'login') setSync('login'); }, 5 * 60 * 1000);
   if (gdTokenOk()) await gdSync(); else setSync('login');
 }
@@ -1220,7 +1243,7 @@ function viewHome() {
   </section>
 
   ${syncState === 'login' ? `<button data-action="gdlogin" class="mt-5 w-full flex items-center gap-4 rounded-[24px] bg-amber-50 border-2 border-amber-200 p-4 text-left hover:bg-amber-100 transition">
-    <span class="text-3xl">🔑</span><span class="flex-1"><b class="block">点这里连接 Google Drive</b><span class="text-sm text-slate-600">读取其他设备的学习进度，并每 5 分钟自动保存</span></span><span class="font-black text-amber-700">登录 →</span></button>` : ''}
+    <span class="text-3xl">🔑</span><span class="flex-1"><b class="block">${S.settings.gdLinked ? '同步已暂停：点这里重新连接' : '点这里连接 Google Drive'}</b><span class="text-sm text-slate-600">${S.settings.gdLinked ? 'Google 登录约 1 小时过期。本机进度没有丢失，重新连接后会自动上传并读取其他设备的进度' : '读取其他设备的学习进度，并每 5 分钟自动保存'}</span></span><span class="font-black text-amber-700">登录 →</span></button>` : ''}
   <h2 class="mt-10 mb-4 text-xl font-black">四个学习阶段</h2>
   <section class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
     ${STAGES.map((s, i) => { const st = stageStats(s.key); return `<button data-action="stage" data-key="${s.key}" class="text-left rounded-[24px] bg-white p-5 shadow-sm border border-black/5 hover:-translate-y-1 hover:shadow-lg transition group">
@@ -1708,6 +1731,7 @@ function confetti() {
 document.addEventListener('click', e => {
   const a = e.target.closest('[data-action]');
   if (!a) return;
+  if (a.dataset.action !== 'gdlogin' && a.dataset.action !== 'syncnow') gdAutoRenew();
   if (a.dataset.action === 'closemodal' && e.target.closest('[data-stop]') && !e.target.closest('button[data-action="closemodal"]')) return;
   const act = a.dataset.action;
   if (act === 'import') return;
@@ -1741,7 +1765,7 @@ document.addEventListener('click', e => {
     case 'syncinfo': showSyncInfo(); break;
     case 'gdlogin': gdLogin(); break;
     case 'saveclient': { const v = ($('#gClientId') || {}).value || ''; S.settings.gClientId = v.trim(); saveLocal(); closeModal(); toast(v.trim() ? '已保存客户端 ID' : '已清除客户端 ID'); if (canDrive()) initDrive(); else { syncProvider = null; setSync(window.claude ? syncState : 'local'); } break; }
-    case 'syncnow': lastPushed = ''; pushNow().then(() => { toast(syncState === 'ok' ? '✅ 已同步' : '同步没有成功，请稍后再试'); showSyncInfo(); }); break;
+    case 'syncnow': if (syncProvider === 'gdrive' && !gdTokenOk()) { gdLogin(); break; } lastPushed = ''; pushNow().then(() => { toast(syncState === 'ok' ? '✅ 已同步' : '同步没有成功，请稍后再试'); showSyncInfo(); }); break;
     case 'syncretry': closeModal(); initSync().then(() => toast(syncState === 'ok' ? '✅ 已连接云同步' : '还是无法连接，请看提示')); break;
     case 'copycode': { const ta = $('#bkOut'); const done = () => toast('已复制进度代码'); const fallback = () => { ta.focus(); ta.select(); toast('已选中，请长按或按 Ctrl+C 复制'); }; try { navigator.clipboard.writeText(ta.value).then(done, fallback); } catch (er) { fallback(); } break; }
     case 'savefile': saveFile(); break;
